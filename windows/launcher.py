@@ -9,7 +9,8 @@ import webbrowser
 from pathlib import Path
 
 
-APP_DIR_NAME = 'LunaSync'
+APP_DIR_NAME = 'Insta360Sync'
+LEGACY_APP_DIR_NAME = 'LunaSync'
 DEFAULT_PORT = 8765
 
 
@@ -27,7 +28,21 @@ def videos_dir():
 def default_paths():
     local_app_data = Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
     data_dir = local_app_data / APP_DIR_NAME
-    download_dir = videos_dir() / 'Luna Sync'
+    download_dir = videos_dir() / 'Insta360 Sync'
+    return data_dir, download_dir
+
+
+def legacy_data_dir():
+    return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / LEGACY_APP_DIR_NAME
+
+
+def resolve_paths(data_dir_arg=None, download_dir_arg=None):
+    default_data_dir, default_download_dir = default_paths()
+    data_dir = Path(data_dir_arg).expanduser() if data_dir_arg else default_data_dir
+    download_dir = Path(download_dir_arg).expanduser() if download_dir_arg else default_download_dir
+    legacy_config_path = legacy_data_dir() / 'config.json'
+    if not data_dir_arg and not (data_dir / 'config.json').exists() and legacy_config_path.exists():
+        data_dir = legacy_config_path.parent
     return data_dir, download_dir
 
 
@@ -91,7 +106,7 @@ def open_when_ready(url):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Luna Sync for Windows')
+    parser = argparse.ArgumentParser(description='Insta360 Sync for Windows')
     parser.add_argument('--download-dir', help='Directory used for downloaded camera media')
     parser.add_argument('--data-dir', help='Directory used for configuration and cache files')
     parser.add_argument('--port', type=int, help='Local WebUI port')
@@ -101,9 +116,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    default_data_dir, default_download_dir = default_paths()
-    data_dir = Path(args.data_dir).expanduser() if args.data_dir else default_data_dir
-    download_dir = Path(args.download_dir).expanduser() if args.download_dir else default_download_dir
+    data_dir, download_dir = resolve_paths(args.data_dir, args.download_dir)
     state_dir = data_dir / 'state'
     config_path = data_dir / 'config.json'
     config = ensure_config(config_path, download_dir, state_dir, args.port or DEFAULT_PORT)
@@ -121,9 +134,9 @@ def main():
         return 0
     if not args.no_browser:
         threading.Thread(target=open_when_ready, args=(url,), daemon=True).start()
-    print('Luna Sync is running at ' + url)
+    print('Insta360 Sync is running at ' + url)
     print('Downloaded media: ' + str(download_dir))
-    print('Close this window to stop Luna Sync.')
+    print('Close this window to stop Insta360 Sync.')
     import web_app
     web_app.run_app(host='127.0.0.1', port=port)
     return 0

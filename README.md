@@ -1,7 +1,10 @@
-# Luna Sync
+# Insta360 Sync
 
-Luna Sync 是一个相机媒体同步工具。它可以连接相机 Wi-Fi，浏览、下载和转码相机中的
+Insta360 Sync 是面向 NAS 的本地相机媒体同步工具。它可以连接相机 Wi-Fi，浏览、下载和转码相机中的
 照片与视频，并提供网页管理界面；支持 Linux Docker/NAS 与 Windows 独立程序。
+
+本仓库由 [Luna Sync](https://github.com/hongjiahao371-pixel/luna-sync) fork 而来，遵循原项目的 MIT 许可证。
+当前可用驱动为 Luna Ultra；v2.0 正在扩展为多设备同步服务，目标支持 Luna Ultra、Ace Pro 2 和 GO Ultra。
 
 ## 功能
 
@@ -31,11 +34,11 @@ Docker Desktop 不能直接管理宿主机无线网卡，但可以使用手动�
 Windows x64 版会直接使用系统无线网络接口，不依赖 Docker、NetworkManager 或
 wpa_supplicant。首次启动会自动打开 `http://127.0.0.1:8765`，默认目录为：
 
-- 素材：`%USERPROFILE%\Videos\Luna Sync`
-- 配置和缓存：`%LOCALAPPDATA%\LunaSync`
+- 素材：`%USERPROFILE%\Videos\Insta360 Sync`
+- 配置和缓存：`%LOCALAPPDATA%\Insta360Sync`
 
-关闭 Luna Sync 的控制台窗口即可退出程序。Windows 可执行文件必须在 Windows 上构建；
-仓库的 `Build Windows EXE` GitHub Actions 会生成 `LunaSync-Windows-x64` 构建产物。
+关闭 Insta360 Sync 的控制台窗口即可退出程序。Windows 可执行文件必须在 Windows 上构建；
+仓库的 `Build Windows EXE` GitHub Actions 会生成 `Insta360Sync-Windows-x64` 构建产物。
 也可以在 Windows PowerShell 中本地构建：
 
 ```powershell
@@ -44,7 +47,7 @@ python windows/prepare_assets.py
 python -m PyInstaller --clean --noconfirm windows/luna_sync.spec
 ```
 
-生成文件位于 `dist\LunaSync.exe`。
+生成文件位于 `dist\Insta360Sync.exe`。
 
 ## Wi-Fi 后端
 
@@ -64,7 +67,7 @@ python -m PyInstaller --clean --noconfirm windows/luna_sync.spec
 docker compose -f docker-compose.yml -f docker-compose.networkmanager.yml up -d --build
 ```
 
-使用 Docker Hub 镜像时：
+使用 GitHub Container Registry 镜像时：
 
 ```bash
 docker compose -f docker-compose.hub.yml -f docker-compose.networkmanager.yml up -d
@@ -94,16 +97,10 @@ docker compose up -d --build
 
 浏览器访问 `http://设备IP:8765`。
 
-也可以直接使用 Docker Hub 镜像：
+也可以直接使用 GitHub Container Registry 镜像：
 
 ```bash
 docker compose -f docker-compose.hub.yml up -d
-```
-
-或使用 GitHub Container Registry 镜像：
-
-```bash
-docker pull ghcr.io/hongjiahao371-pixel/luna-sync:latest
 ```
 
 仓库的 `main` 分支和 `v*` 标签更新后，会通过 GitHub Actions 自动发布 amd64
@@ -115,7 +112,7 @@ docker pull ghcr.io/hongjiahao371-pixel/luna-sync:latest
 app/
   web_app.py       Web 服务
   wifi.py          无线网卡识别与连接
-  luna_client.py   相机通信
+  luna_client.py   Luna Ultra 相机通信（v2.0 将迁移为设备驱动）
   downloader.py    媒体下载
 docker-compose.yml
 docker-compose.hub.yml
@@ -148,6 +145,11 @@ windows/
 
 `config.json`、媒体文件和运行状态已被 Git 忽略。记住 Wi-Fi 功能会将凭据保存在
 `state/wifi.json`，文件权限设置为仅容器用户可读写。请仅在可信局域网中使用。
+
+## 开发路线
+
+v2.0 的实施任务与验收标准见 [多设备 NAS 自动备份 PRD](docs/PRD-multi-insta360-nas-sync.md)。
+本地验证、NAS 部署检查与配置迁移原则见[开发说明](docs/DEVELOPMENT.md)。
 
 ## 更新日志
 

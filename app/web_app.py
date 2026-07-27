@@ -927,7 +927,7 @@ def start_workers():
     threading.Thread(target=keeper, daemon=True).start()
     threading.Thread(target=dl_worker, daemon=True).start()
     threading.Thread(target=auto_sync_worker, daemon=True).start()
-    addlog('Luna Sync 启动，WiFi 后端: ' + WIFI_BACKEND + '，无线网卡: ' + (IFACE or '未检测到'))
+    addlog('Insta360 Sync 启动，WiFi 后端: ' + WIFI_BACKEND + '，无线网卡: ' + (IFACE or '未检测到'))
     addlog('素材保存目录: ' + DLDIR)
 
 def run_app(host=None, port=None):

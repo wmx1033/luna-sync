@@ -30,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LunaSync',
+    name='Insta360Sync',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -41,6 +41,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(ASSETS / 'luna-sync.ico'),
+    icon=str(ASSETS / 'insta360-sync.ico'),
     version=str(ROOT / 'windows' / 'version_info.txt'),
 )

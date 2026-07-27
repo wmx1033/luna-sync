@@ -39,13 +39,13 @@ jobs:
 
       - name: Write checksum
         shell: pwsh
-        run: (Get-FileHash dist/LunaSync.exe -Algorithm SHA256).Hash + "  LunaSync.exe" | Set-Content dist/SHA256SUMS.txt
+        run: (Get-FileHash dist/Insta360Sync.exe -Algorithm SHA256).Hash + "  Insta360Sync.exe" | Set-Content dist/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v7
         with:
-          name: LunaSync-Windows-x64
+          name: Insta360Sync-Windows-x64
           path: |
-            dist/LunaSync.exe
+            dist/Insta360Sync.exe
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
@@ -55,4 +55,4 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/LunaSync.exe dist/SHA256SUMS.txt --title "Luna Sync for Windows ${{ github.ref_name }}" --notes "Windows x64 executable. Double-click LunaSync.exe to start the local WebUI."
+        run: gh release create "${{ github.ref_name }}" dist/Insta360Sync.exe dist/SHA256SUMS.txt --title "Insta360 Sync for Windows ${{ github.ref_name }}" --notes "Windows x64 executable. Double-click Insta360Sync.exe to start the local WebUI."

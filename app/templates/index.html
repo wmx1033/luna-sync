@@ -6,7 +6,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Luna Sync</title>
+<title>Insta360 Sync</title>
 <style>
 :root{color-scheme:light;--bg:#edf1f4;--panel:#ffffff;--ink:#172033;--muted:#667085;--line:#dce3ea;--line2:#edf1f5;--side:#202426;--side2:#292f33;--sideLine:#3a4248;--blue:#3267d6;--green:#259167;--amber:#b66b14;--red:#cf5147;--blue2:#e9f0ff;--green2:#e8f7ef;--amber2:#fff2d8;--red2:#fff0ee;--shadow:0 18px 50px rgba(31,44,67,.12)}
 *{box-sizing:border-box}html,body{min-height:100%}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0;overflow:hidden;height:100vh;display:grid;grid-template-rows:auto minmax(0,1fr) auto}
@@ -30,7 +30,7 @@ button,input,select{font:inherit}button{height:34px;border:1px solid transparent
 <body>
 <header class="appbar">
   <div class="appbar-inner">
-    <div class="brand"><div class="logo">L</div><div><h1>Luna Sync</h1><small id="subtitle">等待状态</small></div></div>
+    <div class="brand"><div class="logo">I</div><div><h1>Insta360 Sync</h1><small id="subtitle">等待状态</small></div></div>
     <div class="statusline">
       <span id="cameraPill" class="pill">相机: 检查中</span>
       <span id="wifiPill" class="pill">Wi-Fi: -</span>
@@ -209,7 +209,7 @@ function logText(s){
   if(out.indexOf('WiFi 后端更新: ')===0)return out.replace('WiFi 后端更新: ','Wi-Fi backend updated: ').replace(/无线网卡/g,'wireless adapter').replace(/未检测到/g,'not detected').replace(/，/g,', ');
   out=out.replace(/未检测到/g,'not detected').replace(/无线网卡/g,'wireless adapter').replace(/WiFi 后端/g,'Wi-Fi backend');
   out=out.replace(/，/g,', ');
-  if(out.indexOf('Luna Sync 启动, ')===0)return out.replace('Luna Sync 启动, ','Luna Sync started, ');
+  if(out.indexOf('Insta360 Sync 启动, ')===0)return out.replace('Insta360 Sync 启动, ','Insta360 Sync started, ');
   if(out.indexOf('素材保存目录: ')===0)return out.replace('素材保存目录: ','Media storage directory: ');
   if(out.indexOf('列文件失败:')===0)return out.replace('列文件失败:','Failed to list files: ');
   if(out.indexOf('已配置相机网段地址 ')===0)return out.replace('已配置相机网段地址 ','Configured camera subnet address ');
