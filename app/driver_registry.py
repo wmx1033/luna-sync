@@ -1,9 +1,11 @@
 """Registry used by the application to choose a camera protocol adapter."""
 
+from drivers.go_ultra import GoUltraDriver
 from drivers.luna_ultra import LunaUltraDriver
 
 
 _DRIVERS = {
+    GoUltraDriver.id: GoUltraDriver,
     LunaUltraDriver.id: LunaUltraDriver,
 }
 
