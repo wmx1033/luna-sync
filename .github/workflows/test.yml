@@ -19,5 +19,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check Python syntax
+        run: python -m compileall -q app tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -p 'test_core.py' -v
