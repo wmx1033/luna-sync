@@ -6,7 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'app'))
 
 from camera_driver import RemoteMedia, file_kind
-from driver_registry import available_drivers, create_driver
+from driver_registry import available_drivers, create_driver, create_driver_for_device
 from drivers import luna_ultra
 
 
@@ -51,6 +51,14 @@ class DriverTests(unittest.TestCase):
     def test_registry_rejects_unknown_driver(self):
         with self.assertRaisesRegex(ValueError, 'unsupported camera driver'):
             create_driver('not-a-camera', '192.168.42.1')
+
+    def test_registry_uses_the_device_driver_and_host(self):
+        with patch.object(luna_ultra, 'LunaClient', FakeLunaClient):
+            driver = create_driver_for_device({
+                'driver': 'luna_ultra',
+                'camera_host': '192.168.42.99',
+            })
+        self.assertEqual(driver.host, '192.168.42.99')
 
     def test_shared_media_kind_classifies_lrv_sidecars(self):
         self.assertIn('luna_ultra', available_drivers())

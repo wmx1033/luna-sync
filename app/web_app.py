@@ -4,8 +4,8 @@ from flask import Flask, jsonify, request, render_template, send_file, Response,
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from camera_driver import file_kind
 from downloader import download_file
-from driver_registry import create_driver
-from sync_store import SyncStore
+from driver_registry import create_driver_for_device
+from sync_store import LEGACY_LUNA_DEVICE_ID, SyncStore
 import wifi
 try:
     from PIL import Image
@@ -25,10 +25,12 @@ def disable_home_cache(response):
 
 HOST = CFG['camera_host']
 DLDIR = os.environ.get('DOWNLOAD_DIR') or CFG['download_dir']
-CAMERA_DRIVER_TYPE = 'luna_ultra'
 
 def active_camera_driver():
-    return create_driver(CAMERA_DRIVER_TYPE, HOST)
+    device = SYNC_STORE.get_device(LEGACY_LUNA_DEVICE_ID)
+    if device:
+        return create_driver_for_device(device)
+    raise RuntimeError('default camera device is unavailable')
 
 def configured_wifi_backend():
     return os.environ.get('LUNA_WIFI_BACKEND') or CFG.get('wifi_backend', 'auto')

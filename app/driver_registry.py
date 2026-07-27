@@ -22,5 +22,9 @@ def create_driver(driver_type, host):
     return factory(host)
 
 
+def create_driver_for_device(device):
+    return create_driver(device['driver'], device['camera_host'])
+
+
 def available_drivers():
     return tuple(sorted(_DRIVERS))
