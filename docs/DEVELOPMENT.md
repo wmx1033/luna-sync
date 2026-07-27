@@ -8,6 +8,7 @@
 python3 -m compileall -q app tests
 python3 -m unittest discover -s tests -p 'test_core.py' -v
 python3 -m unittest discover -s tests -p 'test_sync_store.py' -v
+python3 -m unittest discover -s tests -p 'test_drivers.py' -v
 ```
 
 持续集成会在推送到 `main`、`codex/**` 分支以及所有拉取请求中运行相同的测试。
