@@ -158,6 +158,100 @@ class SyncStoreTests(unittest.TestCase):
             store.add_downloaded_bytes(run['id'], 512)
             self.assertEqual(store.get_sync_run(run['id'])['downloaded_bytes'], 1024)
 
+    def queued_store(self, tmp):
+        store = self.store_at(tmp)
+        store.upsert_device({'id': 'luna', 'display_name': 'Luna Ultra',
+                             'driver': 'luna_ultra', 'camera_host': '192.168.42.1'})
+        store.record_scanned_media('luna', [
+            {'remote_id': 'internal/A.mp4', 'remote_path': 'A.mp4', 'captured_at': '2026-07-10',
+             'kind': 'MP4', 'size_bytes': 10},
+            {'remote_id': 'internal/B.lrv', 'remote_path': 'B.lrv', 'captured_at': '2026-07-11',
+             'kind': 'LRV', 'size_bytes': 20},
+        ])
+        return store
+
+    def test_claiming_takes_one_item_at_a_time_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            first = store.claim_next_media('luna')
+            self.assertEqual(first['remote_id'], 'internal/B.lrv')
+            self.assertEqual(first['status'], 'downloading')
+
+            second = store.claim_next_media('luna')
+            self.assertEqual(second['remote_id'], 'internal/A.mp4')
+            self.assertIsNone(store.claim_next_media('luna'))
+
+    def test_claiming_can_skip_excluded_kinds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            claimed = store.claim_next_media('luna', exclude_kinds=('LRV',))
+            self.assertEqual(claimed['remote_id'], 'internal/A.mp4')
+
+    def test_a_failure_returns_the_item_with_backoff_until_it_is_due(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            claimed = store.claim_next_media('luna')
+            store.fail_media('luna', claimed['remote_id'], message='timeout',
+                             error_code='network_timeout', next_attempt_at='2099-01-01T00:00:00')
+
+            record = store.get_media('luna', claimed['remote_id'])
+            self.assertEqual(record['status'], 'pending')
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['last_error_code'], 'network_timeout')
+
+            # Still backing off, so only the other item is offered.
+            self.assertEqual(store.claim_next_media('luna')['remote_id'], 'internal/A.mp4')
+            self.assertEqual(store.claim_next_media('luna', now='2099-06-01T00:00:00')['remote_id'],
+                             claimed['remote_id'])
+
+    def test_an_unrecoverable_failure_leaves_the_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            claimed = store.claim_next_media('luna')
+            store.fail_media('luna', claimed['remote_id'], message='bad password',
+                             error_code='camera_auth_failed', retryable=False)
+            self.assertEqual(store.get_media('luna', claimed['remote_id'])['status'], 'failed')
+            self.assertEqual(store.claim_next_media('luna')['remote_id'], 'internal/A.mp4')
+
+    def test_completion_clears_retry_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            claimed = store.claim_next_media('luna')
+            store.fail_media('luna', claimed['remote_id'], message='timeout', error_code='x')
+            store.claim_next_media('luna')
+            record = store.complete_media('luna', claimed['remote_id'], '/downloads/B.lrv', 20)
+            self.assertEqual(record['status'], 'complete')
+            self.assertEqual(record['attempts'], 0)
+            self.assertEqual(record['last_error'], '')
+            self.assertEqual(record['local_path'], '/downloads/B.lrv')
+
+    def test_in_flight_downloads_are_requeued_after_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            store.claim_next_media('luna')
+            self.assertEqual(store.queue_snapshot('luna'), {'pending': 1, 'downloading': 1})
+
+            reopened = self.store_at(tmp)
+            self.assertEqual(reopened.requeue_in_flight(), 1)
+            self.assertEqual(reopened.queue_snapshot('luna'), {'pending': 2})
+
+    def test_a_rescan_keeps_retry_state_but_still_notices_finished_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.queued_store(tmp)
+            store.claim_next_media('luna')
+            store.fail_media('luna', 'internal/B.lrv', message='timeout', error_code='x',
+                             retryable=False)
+            store.record_scanned_media('luna', [
+                {'remote_id': 'internal/A.mp4', 'remote_path': 'A.mp4', 'kind': 'MP4',
+                 'local_path': '/downloads/A.mp4', 'status': 'complete', 'size_bytes': 10},
+                {'remote_id': 'internal/B.lrv', 'remote_path': 'B.lrv', 'kind': 'LRV',
+                 'size_bytes': 20},
+            ])
+            self.assertEqual(store.get_media('luna', 'internal/A.mp4')['status'], 'complete')
+            failed = store.get_media('luna', 'internal/B.lrv')
+            self.assertEqual(failed['status'], 'failed')
+            self.assertEqual(failed['attempts'], 1)
+
     def test_new_schema_version_applies_only_its_own_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.store_at(tmp)
@@ -166,7 +260,9 @@ class SyncStoreTests(unittest.TestCase):
             def add_marker_table(conn):
                 conn.execute('CREATE TABLE migration_marker (id INTEGER PRIMARY KEY)')
 
-            MIGRATIONS[2] = add_marker_table
+            shipped = sorted(MIGRATIONS)
+            new_version = shipped[-1] + 1
+            MIGRATIONS[new_version] = add_marker_table
             try:
                 reopened = self.store_at(tmp)
                 reopened.initialize()
@@ -177,10 +273,10 @@ class SyncStoreTests(unittest.TestCase):
                     marker = conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migration_marker'"
                     ).fetchone()
-                self.assertEqual(versions, [1, 2])
+                self.assertEqual(versions, shipped + [new_version])
                 self.assertIsNotNone(marker)
             finally:
-                MIGRATIONS.pop(2, None)
+                MIGRATIONS.pop(new_version, None)
 
 
 if __name__ == '__main__':

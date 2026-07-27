@@ -283,6 +283,18 @@ class SyncStore:
             ).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _add_retry_columns(conn):
+        conn.executescript(
+            '''
+            ALTER TABLE media ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE media ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT '';
+            ALTER TABLE media ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+            ALTER TABLE media ADD COLUMN last_error_code TEXT NOT NULL DEFAULT '';
+            CREATE INDEX media_queue_idx ON media(device_id, status, next_attempt_at);
+            '''
+        )
+
     def record_scanned_media(self, device_id, items):
         """Persist one scan result set in a single transaction.
 
@@ -325,14 +337,22 @@ class SyncStore:
                 ON CONFLICT(device_id, remote_id) DO UPDATE SET
                     storage_id = excluded.storage_id,
                     remote_path = excluded.remote_path,
-                    local_path = excluded.local_path,
+                    local_path = CASE
+                        WHEN excluded.status = 'complete' THEN excluded.local_path
+                        WHEN media.status IN ('failed', 'downloading') THEN media.local_path
+                        ELSE ''
+                    END,
                     size_bytes = COALESCE(excluded.size_bytes, media.size_bytes),
                     captured_at = excluded.captured_at,
                     kind = excluded.kind,
-                    status = excluded.status,
+                    status = CASE
+                        WHEN excluded.status = 'complete' THEN 'complete'
+                        WHEN media.status IN ('failed', 'downloading') THEN media.status
+                        ELSE 'pending'
+                    END,
                     completed_at = CASE
-                        WHEN excluded.status = 'complete' AND media.completed_at <> ''
-                            THEN media.completed_at
+                        WHEN excluded.status <> 'complete' THEN ''
+                        WHEN media.completed_at <> '' THEN media.completed_at
                         ELSE excluded.completed_at
                     END,
                     updated_at = excluded.updated_at
@@ -381,6 +401,114 @@ class SyncStore:
             params.append(status)
         with self._connection() as conn:
             return conn.execute(query, params).fetchone()['total']
+
+    def claim_next_media(self, device_id, now=None, exclude_kinds=(), include_ids=None):
+        """Take the next downloadable item and mark it in flight.
+
+        The queue lives in ``media.status`` so there is only ever one truth
+        about what still needs downloading, including across restarts.
+        """
+        self.initialize()
+        now = now or utc_now()
+        query = '''
+            SELECT id FROM media
+            WHERE device_id = ? AND status = 'pending'
+              AND (next_attempt_at = '' OR next_attempt_at <= ?)
+        '''
+        params = [device_id, now]
+        if exclude_kinds:
+            query += ' AND kind NOT IN (%s)' % ','.join('?' * len(exclude_kinds))
+            params.extend(exclude_kinds)
+        if include_ids is not None:
+            include_ids = list(include_ids)
+            if not include_ids:
+                return None
+            query += ' AND remote_id IN (%s)' % ','.join('?' * len(include_ids))
+            params.extend(include_ids)
+        query += ' ORDER BY captured_at DESC, remote_id LIMIT 1'
+        with self._connection() as conn:
+            while True:
+                row = conn.execute(query, params).fetchone()
+                if not row:
+                    return None
+                claimed = conn.execute(
+                    '''
+                    UPDATE media SET status = 'downloading', updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    ''',
+                    (now, row['id']),
+                )
+                if claimed.rowcount:
+                    return dict(conn.execute('SELECT * FROM media WHERE id = ?',
+                                             (row['id'],)).fetchone())
+
+    def complete_media(self, device_id, remote_id, local_path, size_bytes=None):
+        """Mark an item done and clear its retry state."""
+        self.initialize()
+        now = utc_now()
+        with self._connection() as conn:
+            conn.execute(
+                '''
+                UPDATE media
+                SET status = 'complete', local_path = ?, completed_at = ?, updated_at = ?,
+                    size_bytes = COALESCE(?, size_bytes), attempts = 0, next_attempt_at = '',
+                    last_error = '', last_error_code = ''
+                WHERE device_id = ? AND remote_id = ?
+                ''',
+                (local_path, now, now, size_bytes, device_id, remote_id),
+            )
+        return self.get_media(device_id, remote_id)
+
+    def fail_media(self, device_id, remote_id, message='', error_code='', next_attempt_at='',
+                   retryable=True):
+        """Return an item to the queue with backoff, or park it as failed."""
+        self.initialize()
+        now = utc_now()
+        with self._connection() as conn:
+            conn.execute(
+                '''
+                UPDATE media
+                SET status = ?, attempts = attempts + 1, next_attempt_at = ?,
+                    last_error = ?, last_error_code = ?, updated_at = ?
+                WHERE device_id = ? AND remote_id = ?
+                ''',
+                ('pending' if retryable else 'failed', next_attempt_at, message[:200], error_code,
+                 now, device_id, remote_id),
+            )
+        return self.get_media(device_id, remote_id)
+
+    def requeue_media(self, device_id, remote_id):
+        """Put one item back without counting it as a failed attempt."""
+        self.initialize()
+        with self._connection() as conn:
+            conn.execute(
+                '''
+                UPDATE media SET status = 'pending', next_attempt_at = '', updated_at = ?
+                WHERE device_id = ? AND remote_id = ?
+                ''',
+                (utc_now(), device_id, remote_id),
+            )
+        return self.get_media(device_id, remote_id)
+
+    def requeue_in_flight(self, device_id=None):
+        """Startup recovery: nothing can still be downloading after a restart."""
+        self.initialize()
+        query = "UPDATE media SET status = 'pending', updated_at = ? WHERE status = 'downloading'"
+        params = [utc_now()]
+        if device_id:
+            query += ' AND device_id = ?'
+            params.append(device_id)
+        with self._connection() as conn:
+            return conn.execute(query, params).rowcount
+
+    def queue_snapshot(self, device_id):
+        self.initialize()
+        with self._connection() as conn:
+            rows = conn.execute(
+                'SELECT status, COUNT(*) AS total FROM media WHERE device_id = ? GROUP BY status',
+                (device_id,),
+            ).fetchall()
+        return {row['status']: row['total'] for row in rows}
 
     def start_sync_run(self, device_id):
         self.initialize()
@@ -512,3 +640,4 @@ class SyncStore:
 
 
 MIGRATIONS[1] = SyncStore._create_schema
+MIGRATIONS[2] = SyncStore._add_retry_columns
