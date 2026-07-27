@@ -4,6 +4,7 @@ from flask import Flask, jsonify, request, render_template, send_file, Response,
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from luna_client import LunaClient, file_kind
 from downloader import download_file
+from sync_store import SyncStore
 import wifi
 try:
     from PIL import Image
@@ -45,6 +46,11 @@ WIFI_FILE = os.path.join(STATE_DIR, 'wifi.json')
 SETTINGS_FILE = os.path.join(STATE_DIR, 'settings.json')
 for d in (DLDIR, THUMB_DIR, ENC_DIR, PREVIEW_SRC_DIR):
     os.makedirs(d, exist_ok=True)
+
+# M1 keeps the existing single-camera runtime intact while persisting its
+# equivalent default device for the upcoming multi-device sync engine.
+SYNC_STORE = SyncStore(os.path.join(STATE_DIR, 'sync.db'))
+SYNC_STORE.migrate_legacy_config(CFG)
 
 lk = threading.Lock()
 scan_lk = threading.Lock()
@@ -927,7 +933,7 @@ def start_workers():
     threading.Thread(target=keeper, daemon=True).start()
     threading.Thread(target=dl_worker, daemon=True).start()
     threading.Thread(target=auto_sync_worker, daemon=True).start()
-    addlog('Luna Sync 启动，WiFi 后端: ' + WIFI_BACKEND + '，无线网卡: ' + (IFACE or '未检测到'))
+    addlog('Insta360 Sync 启动，WiFi 后端: ' + WIFI_BACKEND + '，无线网卡: ' + (IFACE or '未检测到'))
     addlog('素材保存目录: ' + DLDIR)
 
 def run_app(host=None, port=None):

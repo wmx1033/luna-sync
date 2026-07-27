@@ -116,6 +116,5 @@ class WindowsLauncherTests(unittest.TestCase):
             self.assertTrue(downloads.is_dir())
             self.assertTrue(state.is_dir())
 
-
 if __name__ == '__main__':
     unittest.main()

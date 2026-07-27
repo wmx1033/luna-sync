@@ -1,7 +1,7 @@
 services:
-  luna-sync:
-    image: jvsheng/luna-sync:latest
-    container_name: luna-sync
+  insta360-sync:
+    image: ghcr.io/wmx1033/insta360-sync:latest
+    container_name: insta360-sync
     network_mode: host
     privileged: true
     restart: unless-stopped

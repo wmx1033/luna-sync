@@ -1,5 +1,5 @@
 services:
-  luna-sync:
+  insta360-sync:
     environment:
       - LUNA_WIFI_BACKEND=networkmanager
     volumes:
