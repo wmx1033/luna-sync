@@ -2,9 +2,10 @@ import os, sys, json, time, threading, socket, subprocess, logging, io, mimetype
 import urllib.request, urllib.error
 from flask import Flask, jsonify, request, render_template, send_file, Response, abort
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from luna_client import LunaClient, file_kind
+from camera_driver import file_kind
 from downloader import download_file
-from sync_store import SyncStore
+from driver_registry import create_driver_for_device
+from sync_store import LEGACY_LUNA_DEVICE_ID, SyncStore
 import wifi
 try:
     from PIL import Image
@@ -24,6 +25,13 @@ def disable_home_cache(response):
 
 HOST = CFG['camera_host']
 DLDIR = os.environ.get('DOWNLOAD_DIR') or CFG['download_dir']
+
+def active_camera_driver():
+    device = SYNC_STORE.get_device(LEGACY_LUNA_DEVICE_ID)
+    if device:
+        return create_driver_for_device(device)
+    raise RuntimeError('default camera device is unavailable')
+
 def configured_wifi_backend():
     return os.environ.get('LUNA_WIFI_BACKEND') or CFG.get('wifi_backend', 'auto')
 
@@ -374,9 +382,9 @@ def refresh():
                 ST['connected'] = False
             return False
         try:
-            cli = LunaClient(HOST)
+            cli = active_camera_driver()
             try:
-                cli.connect(); files = cli.list_files()
+                cli.connect(); files = [media.as_dict() for media in cli.list_media()]
             finally:
                 cli.close()
             loc = local_files()
@@ -511,11 +519,11 @@ def dl_worker():
         addlog('开始下载 ' + name)
         cli = None
         try:
-            cli = LunaClient(HOST); cli.connect()
+            cli = active_camera_driver(); cli.connect()
             def prog(n, d, t, s):
                 with lk:
                     ST['current'] = {'id': key, 'name': n, 'downloaded': d, 'total': t, 'speed': s}
-            download_file(f['url'], dest, on_progress=prog, cancel=cancel)
+            download_file(cli.open_download(f), dest, on_progress=prog, cancel=cancel)
             with lk:
                 ST['completed'] += 1; ST['current'] = None
             addlog('完成 ' + name)
@@ -542,9 +550,9 @@ def transcode_worker(name):
                 with lk: ST['transcodes'][name] = {'status': 'failed', 'msg': '无URL(先扫描文件)'}
                 return
             with lk: ST['transcodes'][name] = {'status': 'downloading'}
-            cli = LunaClient(HOST); cli.connect()
+            cli = active_camera_driver(); cli.connect()
             try:
-                download_file(url, src_file)
+                download_file(cli.open_download({'url': url}), src_file)
             finally:
                 cli.close()
         with lk: ST['transcodes'][name] = {'status': 'encoding'}
@@ -839,7 +847,7 @@ def thumb(name):
             url = file_url(name)
             if not url:
                 return ('', 204)
-            cli = LunaClient(HOST); cli.connect()
+            cli = active_camera_driver(); cli.connect()
             try:
                 data = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'L'}), timeout=20).read()
             finally:
@@ -861,7 +869,7 @@ def img(name):
     url = file_url(name)
     if not url:
         abort(404)
-    cli = LunaClient(HOST); cli.connect()
+    cli = active_camera_driver(); cli.connect()
     try:
         data = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'L'}), timeout=60).read()
     finally:
@@ -876,7 +884,7 @@ def video(name):
     url = file_url(name)
     if not url:
         abort(404)
-    cli = LunaClient(HOST); cli.connect()
+    cli = active_camera_driver(); cli.connect()
     headers = {'User-Agent': 'L'}
     range_h = request.headers.get('Range')
     if range_h:
