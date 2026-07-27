@@ -1,10 +1,15 @@
-import os, sys, json, time, threading, socket, subprocess, logging, io, mimetypes, ipaddress
+import os, sys, json, re, time, threading, socket, subprocess, logging, io, mimetypes, ipaddress
 import urllib.request, urllib.error
 from flask import Flask, jsonify, request, render_template, send_file, Response, abort
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from camera_driver import DriverError, file_kind
+import archive
+import sync_engine
+from camera_driver import file_kind
+from credentials import CredentialStore
 from downloader import download_file
-from driver_registry import create_driver_for_device, device_endpoint, driver_catalog
+from driver_registry import (available_drivers, create_driver_for_device, device_endpoint,
+                             driver_catalog)
+from sync_engine import SyncEngine
 from sync_store import LEGACY_LUNA_DEVICE_ID, SyncStore
 import wifi
 try:
@@ -72,6 +77,9 @@ for d in (DLDIR, THUMB_DIR, ENC_DIR, PREVIEW_SRC_DIR):
 SYNC_STORE = SyncStore(os.path.join(STATE_DIR, 'sync.db'))
 DEVICE = SYNC_STORE.migrate_legacy_config(CFG)
 DEVICE_ID = (DEVICE or {}).get('id', LEGACY_LUNA_DEVICE_ID)
+# Wi-Fi passwords stay out of the sync database; they live in their own
+# owner-only file so a database copied for debugging carries no secrets.
+CREDENTIALS = CredentialStore(os.path.join(STATE_DIR, 'credentials.json'))
 
 lk = threading.Lock()
 scan_lk = threading.Lock()
@@ -130,8 +138,8 @@ def _triggered_scan():
         _scan_cache['ts'] = now
         return r.stdout, False
 
-ST = {'connected': False, 'wifi_conn': False, 'files': [], 'queue': [], 'current': None,
-      'completed': SYNC_STORE.count_media(DEVICE_ID, 'complete'), 'sync_run_id': None,
+ST = {'connected': False, 'wifi_conn': False, 'files': [], 'current': None,
+      'completed': SYNC_STORE.count_media(DEVICE_ID, 'complete'),
       'log': [], 'wifi_current': '', 'wifi_target': CAM_SSID, 'wifi_password': None,
       'wifi_saved': False, 'transcodes': {}, 'auto_sync': bool_value(SETTINGS.get('auto_sync'), bool_value(CFG.get('auto_sync'), True)),
       'auto_sync_lrv': bool_value(SETTINGS.get('auto_sync_lrv'), bool_value(CFG.get('auto_sync_lrv'), True)),
@@ -200,21 +208,21 @@ def ensure_camera_ipv4():
     except Exception as e:
         log.warning('camera_ipv4:' + str(e)[:60])
 
-def wifi_on_target():
+def wifi_on_target(endpoint=None):
     if not CAM_SSID:
         ensure_camera_ipv4()
-        return cam_on()
+        return cam_on(endpoint)
     if not wifi.requires_target_ssid():
-        return cam_on()
+        return cam_on(endpoint)
     cur = current_ssid()
     ok = bool(cur and CAM_SSID and cur == CAM_SSID)
     if ok:
         ensure_camera_ipv4()
     return ok
 
-def cam_on():
+def cam_on(endpoint=None):
     try:
-        socket.create_connection(camera_endpoint(), 2).close(); return True
+        socket.create_connection(endpoint or camera_endpoint(), 2).close(); return True
     except OSError:
         return False
 
@@ -344,18 +352,32 @@ def local_files():
     return out
 
 def local_items():
-    loc = local_files()
-    with lk:
-        meta = {f.get('id', f['name']): dict(f) for f in ST['files']}
+    """Local library from the store, which knows where each file was archived."""
     items = []
-    for key, info in sorted(loc.items()):
+    claimed = set()
+    for device in SYNC_STORE.list_devices():
+        for row in SYNC_STORE.list_media(device['id'], status='complete'):
+            path = row['local_path']
+            if not path or not os.path.isfile(path):
+                continue
+            claimed.add(os.path.abspath(path))
+            date, _, clock = (row['captured_at'] or '').partition(' ')
+            items.append({
+                'id': row['remote_id'], 'name': os.path.basename(row['remote_path']),
+                'kind': row['kind'], 'date': date, 'time': clock, 'size_text': '',
+                'bytes': row['size_bytes'] or os.path.getsize(path),
+                'storage': row['storage_id'], 'device': device['display_name'],
+                'device_id': device['id'], 'completed_at': row['completed_at'],
+                'status': '完成(本地)',
+            })
+    # Files present on disk but unknown to the store stay visible and deletable.
+    for key, info in sorted(local_files().items()):
+        if os.path.abspath(info['path']) in claimed:
+            continue
         name = os.path.basename(key)
-        item = meta.get(key) or meta.get('internal/' + key) or {'id': key, 'name': name, 'kind': file_kind(name), 'date': '', 'time': '', 'size_text': ''}
-        item = dict(item)
-        item.setdefault('id', key)
-        item['bytes'] = info['size']
-        item['status'] = '完成(本地)'
-        items.append(item)
+        items.append({'id': key, 'name': name, 'kind': file_kind(name), 'date': '', 'time': '',
+                      'size_text': '', 'bytes': info['size'], 'storage': '', 'device': '',
+                      'device_id': '', 'completed_at': '', 'status': '完成(本地)'})
     return items
 
 def safe_path(base, name):
@@ -365,7 +387,18 @@ def safe_path(base, name):
         abort(400)
     return path
 
+def inside_archive(path):
+    root = os.path.abspath(DLDIR)
+    resolved = os.path.abspath(path)
+    return resolved.startswith(root + os.sep)
+
 def local_path(name):
+    """Resolve a media key to a file, trusting the archive location on record."""
+    for device in SYNC_STORE.list_devices():
+        row = SYNC_STORE.get_media(device['id'], name)
+        recorded = (row or {}).get('local_path')
+        if recorded and inside_archive(recorded) and os.path.isfile(recorded):
+            return recorded
     loc = local_files()
     if name in loc:
         return loc[name]['path']
@@ -386,83 +419,117 @@ def split_file_id(value):
 def file_key(item):
     return item.get('id') or ((item.get('storage') or 'internal') + '/' + item['name'])
 
-def local_dest_for(item):
-    return safe_path(DLDIR, file_key(item))
-
-def captured_at(item):
-    return ((item.get('date') or '') + ' ' + (item.get('time') or '')).strip()
-
-def start_sync_run():
-    try:
-        run = SYNC_STORE.start_sync_run(DEVICE_ID)
-    except Exception as e:
-        log.warning('start_sync_run:' + str(e)[:60])
-        return None
+def engine_progress(device_id, item, downloaded, total, speed):
     with lk:
-        ST['sync_run_id'] = run['id']
-    return run
+        ST['current'] = {'id': item.id, 'name': item.name, 'downloaded': downloaded,
+                         'total': total, 'speed': speed, 'device_id': device_id}
 
-def finish_sync_run(run, status, scanned=0, added=0, skipped=0, error_summary=''):
-    if not run:
+def engine_event(device_id, state):
+    status = state.get('status')
+    if status in (sync_engine.SYNCING, sync_engine.SCANNING):
         return
-    try:
-        SYNC_STORE.finish_sync_run(run['id'], status, scanned_count=scanned, added_count=added,
-                                   skipped_count=skipped, error_summary=error_summary[:200])
-    except Exception as e:
-        log.warning('finish_sync_run:' + str(e)[:60])
-
-def record_sync_error(exc, fallback='同步失败', remote_id='', code=''):
-    """Keep driver and download failures in the device history instead of only in logs."""
-    retryable = True
-    if isinstance(exc, DriverError):
-        code = code or exc.code
-        retryable = exc.retryable
-    code = code or 'internal_error'
-    message = (str(exc) or fallback)[:200]
     with lk:
-        run_id = ST['sync_run_id']
+        if status not in (sync_engine.CONNECTING, sync_engine.WAITING):
+            ST['current'] = None
+
+def device_ssid(device):
+    """The hotspot this device needs, falling back to the pre-multi-device config."""
+    ssid = (device.get('ssid') or '').strip()
+    if ssid:
+        return ssid
+    return CAM_SSID if device.get('id') == DEVICE_ID else ''
+
+def device_password(device):
+    password = CREDENTIALS.get(device['id'])
+    if password:
+        return password
+    return DEF_PW if device.get('id') == DEVICE_ID else None
+
+def device_reachable(device):
+    """Put this camera's address within reach, using its own Wi-Fi credentials."""
+    endpoint = device_endpoint(device)
+    refresh_wifi_backend(start_wpa=True)
+    ssid = device_ssid(device)
+    if not wifi.can_control() or not ssid:
+        # Manual mode, or no hotspot configured: only reachability matters.
+        ensure_camera_ipv4()
+        if cam_on(endpoint):
+            return True
+        if not wifi.can_control():
+            auto_notice('自动同步等待手动连接相机 WiFi')
+        else:
+            auto_notice('设备「%s」尚未填写 WiFi 名称' % device.get('display_name', ''))
+        return False
+    if current_ssid() == ssid:
+        ensure_camera_ipv4()
+        if cam_on(endpoint):
+            return True
+    password = device_password(device)
+    if not password:
+        auto_notice('设备「%s」还没有保存 WiFi 密码' % device.get('display_name', ''))
+        return False
+    return try_connect(ssid, password) and cam_on(endpoint)
+
+def migrate_legacy_credentials():
+    """Fold the single-camera password into the per-device credential store."""
+    if CREDENTIALS.has(DEVICE_ID):
+        return False
+    saved = load_saved_wifi() or {}
+    password = saved.get('password') or DEF_PW
+    if not password:
+        return False
+    CREDENTIALS.set(DEVICE_ID, password)
+    return True
+
+ENGINE = SyncEngine(store=SYNC_STORE, download_root=DLDIR,
+                    driver_factory=create_driver_for_device, connector=device_reachable,
+                    download=download_file, log=log, on_progress=engine_progress,
+                    on_event=engine_event, on_notice=addlog)
+
+def prepare_archive():
+    """Move a v1 archive into the per-device layout before any sync starts.
+
+    Renames inside one file system are atomic, so an interrupted migration
+    simply continues on the next start.  Every relocated file is recorded as
+    already downloaded, which is what stops a relayout from looking like an
+    empty archive worth fetching again.
+    """
     try:
-        SYNC_STORE.record_error(DEVICE_ID, message, sync_run_id=run_id, remote_id=remote_id,
-                                error_code=code, retryable=retryable)
+        device = active_device()
     except Exception as e:
-        log.warning('record_error:' + str(e)[:60])
-    return message
-
-def scanned_media_records(files, loc):
-    records = []
-    for f in files:
-        key = file_key(f)
-        local = loc.get(key)
-        if local is None and f.get('storage') == 'internal':
-            local = loc.get(f['name'])
-        records.append({
-            'remote_id': key,
-            'storage_id': f.get('storage') or 'internal',
-            'remote_path': f.get('path') or f['name'],
-            'local_path': local['path'] if local else '',
-            'size_bytes': local['size'] if local else f.get('bytes'),
-            'captured_at': captured_at(f),
-            'kind': f.get('kind') or file_kind(f['name']),
-            'status': 'complete' if local else 'pending',
-        })
-    return records
-
-def record_completed_media(item, dest, size_bytes):
-    key = file_key(item)
-    try:
-        SYNC_STORE.mark_media_complete(
-            DEVICE_ID, key, dest, size_bytes=size_bytes,
-            storage_id=item.get('storage') or 'internal',
-            remote_path=item.get('path') or item['name'],
-            kind=item.get('kind') or file_kind(item['name']),
-            captured_at=captured_at(item))
+        log.warning('prepare_archive:' + str(e)[:60])
+        return []
+    captured = {row['remote_id']: row['captured_at']
+                for row in SYNC_STORE.list_media(device['id']) if row['captured_at']}
+    report = archive.migrate_legacy_archive(DLDIR, device, captured_at=captured)
+    moved = failed = 0
+    for item in report:
+        if item['status'] == 'failed':
+            failed += 1
+            log.warning('archive move %s: %s', item['source'], item.get('error', '')[:60])
+            continue
+        if item['status'] == 'duplicate' or item['partial']:
+            continue
+        moved += 1
+        try:
+            SYNC_STORE.mark_media_complete(
+                device['id'], item['remote_id'], item['destination'],
+                size_bytes=os.path.getsize(item['destination']),
+                storage_id=item['storage'], remote_path=item['filename'],
+                kind=file_kind(item['filename']),
+                captured_at=captured.get(item['remote_id'], ''))
+        except OSError as e:
+            log.warning('archive record:' + str(e)[:60])
+    if moved:
+        addlog('已将 ' + str(moved) + ' 个旧素材整理到新的归档目录')
         with lk:
-            run_id = ST['sync_run_id']
-        SYNC_STORE.add_downloaded_bytes(run_id, size_bytes)
-    except Exception as e:
-        log.warning('record_media:' + str(e)[:60])
+            ST['completed'] = SYNC_STORE.count_media(DEVICE_ID, 'complete')
+    if failed:
+        addlog(str(failed) + ' 个旧素材整理失败，已保留在原位置')
+    return report
 
-def refresh(persist=False):
+def refresh():
+    """Read the camera listing for the UI; the engine owns what gets persisted."""
     with refresh_lk:
         if not (wifi_on_target() and cam_on()):
             with lk:
@@ -474,96 +541,106 @@ def refresh(persist=False):
                 cli.connect(); files = [media.as_dict() for media in cli.list_media()]
             finally:
                 cli.close()
-            loc = local_files()
+            done = {row['remote_id'] for row in SYNC_STORE.list_media(DEVICE_ID, status='complete')}
             for f in files:
                 key = file_key(f)
                 f['id'] = key
-                legacy_done = f.get('storage') == 'internal' and f['name'] in loc
-                f['status'] = '完成' if key in loc or legacy_done else '就绪'
+                f['status'] = '完成' if key in done or local_path(key) else '就绪'
             with lk:
                 ST['files'] = files; ST['connected'] = True
-            if persist:
-                try:
-                    SYNC_STORE.record_scanned_media(DEVICE_ID, scanned_media_records(files, loc))
-                    with lk:
-                        ST['completed'] = SYNC_STORE.count_media(DEVICE_ID, 'complete')
-                except Exception as e:
-                    log.warning('record_scanned_media:' + str(e)[:60])
             return True
         except Exception as e:
             addlog('列文件失败:' + str(e)[:60])
-            if persist:
-                record_sync_error(e, '扫描相机文件失败')
             with lk:
                 ST['connected'] = False
             return False
 
-def enqueue(names):
-    loc = local_files()
-    added = 0
-    skipped = []
+def selected_ids(names):
+    """Map whatever the UI sent onto stable media ids."""
     with lk:
-        current = ST['current'].get('id') if ST['current'] else None
         known = {file_key(f): f for f in ST['files']}
         by_name = {f['name']: file_key(f) for f in ST['files']}
-        for name in names:
-            key = name if name in known else by_name.get(name, name)
-            item = known.get(key)
-            legacy_done = item and item.get('storage') == 'internal' and item['name'] in loc
-            if key in loc or legacy_done:
-                skipped.append({'name': name, 'reason': 'already_local'})
-                continue
-            if key in ST['queue'] or key == current:
-                skipped.append({'name': name, 'reason': 'already_queued'})
-                continue
-            if key not in known:
-                skipped.append({'name': name, 'reason': 'not_available'})
-                continue
-            ST['queue'].append(key)
-            added += 1
-    return added, skipped
+    ids, skipped = [], []
+    for name in names:
+        key = name if name in known else by_name.get(name, name)
+        if key not in known and not SYNC_STORE.get_media(DEVICE_ID, key):
+            skipped.append({'name': name, 'reason': 'not_available'})
+            continue
+        if local_path(key):
+            skipped.append({'name': name, 'reason': 'already_local'})
+            continue
+        ids.append(key)
+    return ids, skipped
 
-def auto_sync_once(manual=False):
+def sync_summary_log(summaries, manual):
+    downloaded = sum(s.get('downloaded', 0) for s in summaries)
+    failed = sum(s.get('failed', 0) for s in summaries)
+    waiting = [s for s in summaries if s.get('status') == sync_engine.WAITING]
+    if downloaded:
+        addlog('同步完成 ' + str(downloaded) + ' 个文件')
+    if failed:
+        addlog(str(failed) + ' 个文件同步失败，稍后重试')
+    if waiting and manual:
+        addlog('已有同步任务占用无线网卡，本次排队等待')
+    if manual and not downloaded and not failed and not waiting:
+        addlog('同步检查完成，没有新文件')
+    return downloaded
+
+def run_sync(manual=False, only_ids=None, scan_only=False):
     if not auto_sync_lk.acquire(blocking=False):
         if manual:
-            addlog('自动同步已在运行')
+            addlog('同步已在进行中')
         return 0
     try:
-        # A run is only opened once the camera actually answers, so an absent
-        # camera stays "waiting" instead of filling the history with errors.
-        if not prepare_auto_sync_connection():
-            if manual:
-                addlog('自动同步未开始: 相机未就绪')
-            return 0
-        run = start_sync_run()
-        try:
-            if not refresh(persist=True):
-                if manual:
-                    addlog('自动同步未开始: 扫描相机文件失败')
-                finish_sync_run(run, 'error', error_summary='扫描相机文件失败')
-                return 0
-            with lk:
-                include_lrv = ST['auto_sync_lrv']
-                files = list(ST['files'])
-                names = [file_key(f) for f in files if include_lrv or f.get('kind') != 'LRV']
-                skipped_lrv = len(files) - len(names)
-            if skipped_lrv and manual:
-                addlog('自动同步跳过 ' + str(skipped_lrv) + ' 个 LRV 文件')
-            added, _ = enqueue(names)
-            with lk:
-                ST['last_auto_sync'] = time.strftime('%H:%M:%S')
-            finish_sync_run(run, 'success', scanned=len(files), added=added,
-                            skipped=len(files) - added)
-            if added:
-                addlog('自动同步加入 ' + str(added) + ' 个新文件')
-            elif manual:
-                addlog('自动同步检查完成，没有新文件')
-            return added
-        except Exception as e:
-            finish_sync_run(run, 'error', error_summary=record_sync_error(e, '自动同步失败'))
-            raise
+        cancel.clear()
+        with lk:
+            include_lrv = ST['auto_sync_lrv']
+        exclude = () if include_lrv or only_ids is not None else ('LRV',)
+        if only_ids is not None:
+            summaries = [ENGINE.sync_device(active_device(), cancel=cancel, only_ids=only_ids)]
+        else:
+            summaries = ENGINE.run_once(cancel=cancel, exclude_kinds=exclude, scan_only=scan_only)
+        with lk:
+            ST['last_auto_sync'] = time.strftime('%H:%M:%S')
+            ST['completed'] = SYNC_STORE.count_media(DEVICE_ID, 'complete')
+            ST['current'] = None
+        return sync_summary_log(summaries, manual)
+    except Exception as e:
+        log.warning('run_sync:' + str(e)[:60])
+        addlog('同步失败:' + str(e)[:60])
+        return 0
     finally:
+        cancel.clear()
         auto_sync_lk.release()
+
+def run_device_sync(device_id, scan_only=False):
+    """Sync one device on demand, sharing the radio lock with the auto loop."""
+    if not auto_sync_lk.acquire(blocking=False):
+        addlog('同步已在进行中，稍后重试')
+        return 0
+    try:
+        device = SYNC_STORE.get_device(device_id)
+        if not device:
+            return 0
+        cancel.clear()
+        with lk:
+            include_lrv = ST['auto_sync_lrv']
+        summary = ENGINE.sync_device(device, cancel=cancel, scan_only=scan_only,
+                                     exclude_kinds=() if include_lrv else ('LRV',))
+        with lk:
+            ST['completed'] = SYNC_STORE.count_media(DEVICE_ID, 'complete')
+            ST['current'] = None
+        return sync_summary_log([summary], manual=True)
+    except Exception as e:
+        log.warning('device_sync:' + str(e)[:60])
+        addlog('同步失败:' + str(e)[:60])
+        return 0
+    finally:
+        cancel.clear()
+        auto_sync_lk.release()
+
+def auto_sync_once(manual=False):
+    return run_sync(manual=manual)
 
 def auto_notice(message):
     global last_auto_notice
@@ -572,79 +649,16 @@ def auto_notice(message):
         addlog(message)
         last_auto_notice = now
 
-def prepare_auto_sync_connection():
-    refresh_wifi_backend(start_wpa=True)
-    if wifi_on_target() and cam_on():
-        return True
-    with lk:
-        target = ST['wifi_target']; pw = ST['wifi_password'] or DEF_PW; saved = ST['wifi_saved']
-    if wifi.can_control() and target and pw is not None:
-        return try_connect(target, pw) and wifi_on_target() and cam_on()
-    if wifi.can_control() and not target:
-        auto_notice('自动同步等待记住 Luna WiFi')
-    elif not wifi.can_control():
-        auto_notice('自动同步等待手动连接 Luna WiFi')
-    elif not saved:
-        auto_notice('自动同步需要先记住 Luna WiFi 密码')
-    return False
-
 def auto_sync_worker():
     while True:
         try:
             with lk:
                 enabled = ST['auto_sync']
             if enabled:
-                auto_sync_once()
+                run_sync()
         except Exception as e:
             log.warning('auto_sync:' + str(e)[:60])
         time.sleep(AUTO_INTERVAL)
-
-def dl_worker():
-    while True:
-        key = None
-        with lk:
-            if ST['queue']:
-                key = ST['queue'].pop(0)
-        if not key:
-            time.sleep(2); continue
-        cancel.clear()
-        with lk:
-            f = next((x for x in ST['files'] if file_key(x) == key or x['name'] == key), None)
-        if not f:
-            addlog(key + ' 不在列表'); continue
-        name = f['name']
-        key = file_key(f)
-        if not (wifi_on_target() and cam_on()):
-            with lk:
-                ST['queue'].insert(0, key)
-            time.sleep(15); continue
-        dest = local_dest_for(f)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with lk:
-            ST['current'] = {'id': key, 'name': name, 'downloaded': 0, 'total': f.get('bytes'), 'speed': 0}
-        addlog('开始下载 ' + name)
-        cli = None
-        try:
-            cli = active_camera_driver(); cli.connect()
-            def prog(n, d, t, s):
-                with lk:
-                    ST['current'] = {'id': key, 'name': n, 'downloaded': d, 'total': t, 'speed': s}
-            download_file(cli.open_download(f), dest, on_progress=prog, cancel=cancel)
-            size = os.path.getsize(dest) if os.path.exists(dest) else f.get('bytes')
-            record_completed_media(f, dest, size)
-            with lk:
-                ST['completed'] += 1; ST['current'] = None
-            addlog('完成 ' + name)
-        except Exception as e:
-            record_sync_error(e, '下载失败', remote_id=key,
-                              code='cancelled' if str(e) == 'cancelled' else '')
-            addlog('失败 ' + name + ':' + str(e)[:60])
-            with lk:
-                ST['current'] = None
-        finally:
-            if cli:
-                cli.close()
-            cancel.clear()
 
 
 def transcode_worker(name):
@@ -717,13 +731,23 @@ def play(name):
 def idx():
     return render_template('index.html')
 
+def queue_length():
+    """Outstanding work now lives in the store, so it survives a restart."""
+    try:
+        snapshot = SYNC_STORE.queue_snapshot(DEVICE_ID)
+    except Exception as e:
+        log.warning('queue_snapshot:' + str(e)[:60])
+        return 0
+    return snapshot.get('pending', 0) + snapshot.get('downloading', 0)
+
 @app.route('/api/state')
 def api_state():
     refresh_wifi_backend()
+    queued = queue_length()
     with lk:
         return jsonify({'connected': ST['connected'], 'wifi_conn': ST['wifi_conn'],
             'wifi_current': ST['wifi_current'], 'wifi_saved': ST['wifi_saved'],
-            'file_count': len(ST['files']), 'queue_len': len(ST['queue']),
+            'file_count': len(ST['files']), 'queue_len': queued,
             'current': ST['current'], 'completed': ST['completed'],
             'log': ST['log'][-12:], 'camera_ssid': CAM_SSID, 'wifi_iface': IFACE,
             'wifi_backend': WIFI_BACKEND, 'wifi_control': wifi.can_control(),
@@ -735,24 +759,153 @@ def api_state():
 
 def device_public(device):
     """Device view for the UI; connection secrets never leave the store."""
+    device_id = device['id']
     view = {
-        'id': device['id'],
+        'id': device_id,
         'display_name': device['display_name'],
         'driver': device['driver'],
         'camera_host': device['camera_host'],
-        'ssid': device['ssid'],
+        'ssid': device_ssid(device),
         'priority': device['priority'],
         'enabled': bool(device['enabled']),
-        'archive_root': device['archive_root'],
-        'has_credential': bool(device['credential_ref']),
+        'has_credential': bool(device_password(device)),
     }
-    view.update(SYNC_STORE.device_summary(device['id']))
+    view.update(SYNC_STORE.device_summary(device_id))
+    view['queue'] = SYNC_STORE.queue_snapshot(device_id)
+    state = ENGINE.state(device_id)
+    view['state'] = state.get('status') or ('idle' if device['enabled'] else 'disabled')
+    view['state_message'] = state.get('message', '')
     return view
+
+HOSTNAME_RE = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,252}[A-Za-z0-9])?$')
+
+def clean_text(value, limit=120):
+    return str(value or '').strip()[:limit]
+
+def validate_device(data, existing=None):
+    """Return ``(values, password, errors)`` for a create or edit request."""
+    errors = []
+    base = existing or {}
+    name = clean_text(data.get('display_name', base.get('display_name')))
+    if not name:
+        errors.append('请填写设备名称')
+
+    driver = clean_text(data.get('driver', base.get('driver')), 40)
+    if driver not in available_drivers():
+        errors.append('不支持的驱动: ' + (driver or '(空)'))
+
+    host = clean_text(data.get('camera_host', base.get('camera_host')), 255)
+    if not host:
+        errors.append('请填写相机地址')
+    elif not HOSTNAME_RE.match(host):
+        errors.append('相机地址格式不正确')
+
+    try:
+        priority = int(data.get('priority', base.get('priority', 100)))
+    except (TypeError, ValueError):
+        priority = 100
+        errors.append('优先级必须是整数')
+    priority = max(0, min(9999, priority))
+
+    values = {
+        'id': base.get('id') or new_device_id(name),
+        'display_name': name,
+        'driver': driver,
+        'camera_host': host,
+        'ssid': clean_text(data.get('ssid', base.get('ssid')), 64),
+        'priority': priority,
+        'enabled': bool_value(data.get('enabled', base.get('enabled', True)), True),
+        'archive_root': base.get('archive_root', ''),
+    }
+    # The store never sees the secret itself, only whether one exists.
+    password = data.get('password')
+    if password is not None:
+        password = str(password)
+        if len(password) > 128:
+            errors.append('WiFi 密码过长')
+    values['credential_ref'] = 'credential-store' if (
+        password or (existing and device_password(base))) else ''
+    return values, password, errors
+
+def new_device_id(name):
+    base = archive.slugify(name) or 'camera'
+    taken = {device['id'] for device in SYNC_STORE.list_devices()}
+    if base not in taken:
+        return base
+    for index in range(2, 100):
+        candidate = '%s-%d' % (base, index)
+        if candidate not in taken:
+            return candidate
+    return '%s-%d' % (base, int(time.time()))
 
 @app.route('/api/devices')
 def api_devices():
     return jsonify({'items': [device_public(d) for d in SYNC_STORE.list_devices()],
                     'active': DEVICE_ID, 'drivers': driver_catalog()})
+
+@app.route('/api/devices', methods=['POST'])
+def api_device_create():
+    values, password, errors = validate_device(request.json or {})
+    if errors:
+        return jsonify({'ok': False, 'errors': errors}), 400
+    device = SYNC_STORE.upsert_device(values)
+    if password:
+        CREDENTIALS.set(device['id'], password)
+    addlog('新增设备: ' + device['display_name'])
+    return jsonify({'ok': True, 'device': device_public(device)}), 201
+
+@app.route('/api/devices/<device_id>', methods=['PATCH', 'PUT'])
+def api_device_update(device_id):
+    existing = SYNC_STORE.get_device(device_id)
+    if not existing:
+        abort(404)
+    values, password, errors = validate_device(request.json or {}, existing=existing)
+    if errors:
+        return jsonify({'ok': False, 'errors': errors}), 400
+    device = SYNC_STORE.upsert_device(values)
+    if password is not None:
+        CREDENTIALS.set(device_id, password)
+    addlog('更新设备: ' + device['display_name'])
+    return jsonify({'ok': True, 'device': device_public(device)})
+
+@app.route('/api/devices/<device_id>', methods=['DELETE'])
+def api_device_delete(device_id):
+    device = SYNC_STORE.get_device(device_id)
+    if not device:
+        abort(404)
+    if device_id == DEVICE_ID:
+        return jsonify({'ok': False,
+                        'errors': ['默认设备来自旧配置，暂不支持删除']}), 400
+    SYNC_STORE.delete_device(device_id)
+    CREDENTIALS.delete(device_id)
+    addlog('删除设备: ' + device['display_name'] + '（本地已备份文件保留）')
+    return jsonify({'ok': True})
+
+@app.route('/api/devices/<device_id>/test', methods=['POST'])
+def api_device_test(device_id):
+    device = SYNC_STORE.get_device(device_id)
+    if not device:
+        abort(404)
+    result = ENGINE.test_device(device)
+    if result.get('ok'):
+        probe = result.get('probe') or {}
+        addlog('测试连接成功: %s (%s)' % (device['display_name'],
+                                          probe.get('model') or probe.get('driver')))
+    else:
+        addlog('测试连接失败: %s - %s' % (device['display_name'], result.get('message', '')))
+    return jsonify(result)
+
+@app.route('/api/devices/<device_id>/sync', methods=['POST'])
+def api_device_sync(device_id):
+    device = SYNC_STORE.get_device(device_id)
+    if not device:
+        abort(404)
+    if not device['enabled']:
+        return jsonify({'ok': False, 'errors': ['设备已禁用']}), 400
+    scan_only = bool_value((request.json or {}).get('scan_only'))
+    threading.Thread(target=run_device_sync, args=(device_id, scan_only), daemon=True).start()
+    addlog(('开始扫描 ' if scan_only else '开始同步 ') + device['display_name'])
+    return jsonify({'ok': True})
 
 @app.route('/api/devices/<device_id>/runs')
 def api_device_runs(device_id):
@@ -869,10 +1022,13 @@ def api_local_files():
 @app.route('/api/download', methods=['POST'])
 def api_dl():
     ns = (request.json or {}).get('files', [])
-    added, skipped = enqueue(ns)
-    addlog('队列 +' + str(added))
+    ids, skipped = selected_ids(ns)
     msg = ''
-    if not added:
+    if ids:
+        addlog('开始同步 ' + str(len(ids)) + ' 个文件')
+        threading.Thread(target=run_sync, kwargs={'manual': True, 'only_ids': ids},
+                         daemon=True).start()
+    else:
         reasons = {s['reason'] for s in skipped}
         with lk:
             connected = ST['connected']
@@ -882,9 +1038,7 @@ def api_dl():
             msg = '相机未连接，无法下载新素材'
         elif 'not_available' in reasons:
             msg = '所选文件不在当前相机列表'
-        elif 'already_queued' in reasons:
-            msg = '所选文件已在队列中'
-    return jsonify({'queued': added, 'skipped': skipped, 'msg': msg})
+    return jsonify({'queued': len(ids), 'skipped': skipped, 'msg': msg})
 
 @app.route('/api/cancel', methods=['POST'])
 def api_can():
@@ -1076,8 +1230,11 @@ def start_workers():
         if workers_started:
             return
         workers_started = True
+    if migrate_legacy_credentials():
+        addlog('已将原有 WiFi 密码迁移到按设备保存的凭据文件')
+    prepare_archive()
+    ENGINE.recover()
     threading.Thread(target=keeper, daemon=True).start()
-    threading.Thread(target=dl_worker, daemon=True).start()
     threading.Thread(target=auto_sync_worker, daemon=True).start()
     addlog('Insta360 Sync 启动，WiFi 后端: ' + WIFI_BACKEND + '，无线网卡: ' + (IFACE or '未检测到'))
     addlog('素材保存目录: ' + DLDIR)
