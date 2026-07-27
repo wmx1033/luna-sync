@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'app'))
 
-from sync_store import LEGACY_LUNA_DEVICE_ID, SyncStore
+from sync_store import LEGACY_LUNA_DEVICE_ID, MIGRATIONS, SyncStore
 
 
 class SyncStoreTests(unittest.TestCase):
@@ -82,6 +82,30 @@ class SyncStoreTests(unittest.TestCase):
             with reopened._connection() as conn:
                 error = conn.execute('SELECT * FROM sync_errors WHERE sync_run_id = ?', (run['id'],)).fetchone()
             self.assertEqual(error['error_code'], 'offline')
+
+    def test_new_schema_version_applies_only_its_own_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.store_at(tmp)
+            store.initialize()
+
+            def add_marker_table(conn):
+                conn.execute('CREATE TABLE migration_marker (id INTEGER PRIMARY KEY)')
+
+            MIGRATIONS[2] = add_marker_table
+            try:
+                reopened = self.store_at(tmp)
+                reopened.initialize()
+                with reopened._connection() as conn:
+                    versions = [row['version'] for row in conn.execute(
+                        'SELECT version FROM schema_migrations ORDER BY version'
+                    )]
+                    marker = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migration_marker'"
+                    ).fetchone()
+                self.assertEqual(versions, [1, 2])
+                self.assertIsNotNone(marker)
+            finally:
+                MIGRATIONS.pop(2, None)
 
 
 if __name__ == '__main__':

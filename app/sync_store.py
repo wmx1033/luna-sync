@@ -12,8 +12,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 1
 LEGACY_LUNA_DEVICE_ID = 'luna-ultra-default'
+MIGRATIONS = {}
 
 
 def utc_now():
@@ -54,12 +54,18 @@ class SyncStore:
         os.makedirs(parent, exist_ok=True)
         with self._connection() as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)')
-            exists = conn.execute(
-                'SELECT 1 FROM schema_migrations WHERE version = ?', (SCHEMA_VERSION,)
-            ).fetchone()
-            if not exists:
-                self._create_schema(conn)
-                conn.execute('INSERT INTO schema_migrations(version) VALUES (?)', (SCHEMA_VERSION,))
+            applied = {
+                row['version'] for row in conn.execute('SELECT version FROM schema_migrations')
+            }
+            unknown_versions = applied.difference(MIGRATIONS)
+            if unknown_versions:
+                raise RuntimeError(
+                    'database schema is newer than this application: %s' % max(unknown_versions)
+                )
+            for version in sorted(MIGRATIONS):
+                if version not in applied:
+                    MIGRATIONS[version](conn)
+                    conn.execute('INSERT INTO schema_migrations(version) VALUES (?)', (version,))
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -312,3 +318,6 @@ class SyncStore:
             error_id = cursor.lastrowid
             row = conn.execute('SELECT * FROM sync_errors WHERE id = ?', (error_id,)).fetchone()
         return dict(row)
+
+
+MIGRATIONS[1] = SyncStore._create_schema
