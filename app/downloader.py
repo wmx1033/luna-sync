@@ -2,7 +2,37 @@ import os, re, time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-def download_file(url, dest, on_progress=None, cancel=None, chunk=262144):
+USER_AGENT = 'LunaDL/0.1'
+
+def resolve_target(target):
+    """Accept either a plain URL or a driver supplied download target."""
+    url = getattr(target, 'url', None)
+    if url is None:
+        return str(target), {}, True
+    headers = dict(getattr(target, 'headers', None) or {})
+    return url, headers, bool(getattr(target, 'supports_range', True))
+
+def build_headers(extra, **overrides):
+    headers = {'User-Agent': USER_AGENT}
+    headers.update(extra)
+    headers.update(overrides)
+    return headers
+
+def probe_total(url, extra):
+    try:
+        r = urlopen(Request(url, headers=build_headers(extra, Range='bytes=0-0')), timeout=10)
+        cr = r.headers.get('Content-Range')
+        r.close()
+        if cr:
+            m = re.search(r'/(\d+)', cr)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+def download_file(target, dest, on_progress=None, cancel=None, chunk=262144):
+    url, extra, supports_range = resolve_target(target)
     os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
     partial = dest + '.part'
     name = os.path.basename(dest)
@@ -13,26 +43,20 @@ def download_file(url, dest, on_progress=None, cancel=None, chunk=262144):
             on_progress(name, sz, sz, 0)
         return dest
 
-    total = None
-    try:
-        r = urlopen(Request(url, headers={'User-Agent': 'LunaDL/0.1', 'Range': 'bytes=0-0'}), timeout=10)
-        cr = r.headers.get('Content-Range')
-        if cr:
-            m = re.search(r'/(\d+)', cr)
-            if m:
-                total = int(m.group(1))
-        r.close()
-    except Exception:
-        pass
+    total = probe_total(url, extra) if supports_range else None
 
     existing = os.path.getsize(partial) if os.path.exists(partial) else 0
+    if existing and not supports_range:
+        # The driver cannot resume, so a leftover fragment can only be restarted.
+        os.remove(partial)
+        existing = 0
     if total and existing >= total:
         os.replace(partial, dest)
         if on_progress:
             on_progress(name, total, total, 0)
         return dest
 
-    headers = {'User-Agent': 'LunaDL/0.1'}
+    headers = build_headers(extra)
     if existing > 0:
         headers['Range'] = 'bytes=' + str(existing) + '-'
     try:
@@ -44,7 +68,7 @@ def download_file(url, dest, on_progress=None, cancel=None, chunk=262144):
                 return dest
             os.remove(partial)
             existing = 0
-            resp = urlopen(Request(url, headers={'User-Agent': 'LunaDL/0.1'}), timeout=30)
+            resp = urlopen(Request(url, headers=build_headers(extra)), timeout=30)
         else:
             raise
 

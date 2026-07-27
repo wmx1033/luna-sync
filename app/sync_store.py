@@ -30,6 +30,7 @@ class SyncStore:
 
     def __init__(self, path):
         self.path = os.fspath(path)
+        self._ready = False
 
     def _connect(self):
         conn = sqlite3.connect(self.path)
@@ -50,6 +51,8 @@ class SyncStore:
             conn.close()
 
     def initialize(self):
+        if self._ready:
+            return
         parent = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(parent, exist_ok=True)
         with self._connection() as conn:
@@ -70,6 +73,7 @@ class SyncStore:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+        self._ready = True
 
     @staticmethod
     def _create_schema(conn):
@@ -222,6 +226,13 @@ class SyncStore:
             rows = conn.execute('SELECT * FROM devices ORDER BY priority, display_name, id').fetchall()
         return [dict(row) for row in rows]
 
+    def delete_device(self, device_id):
+        """Remove a device together with its media, runs and errors."""
+        self.initialize()
+        with self._connection() as conn:
+            cursor = conn.execute('DELETE FROM devices WHERE id = ?', (device_id,))
+        return cursor.rowcount > 0
+
     def record_media(self, media):
         self.initialize()
         now = utc_now()
@@ -272,6 +283,105 @@ class SyncStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def record_scanned_media(self, device_id, items):
+        """Persist one scan result set in a single transaction.
+
+        The scan compares the camera listing against local files, so it is the
+        authority on completion state; only the original completion timestamp
+        survives an update.
+        """
+        self.initialize()
+        now = utc_now()
+        rows = []
+        for item in items:
+            status = item.get('status') or 'pending'
+            complete = status == 'complete'
+            rows.append({
+                'device_id': device_id,
+                'remote_id': item['remote_id'],
+                'storage_id': item.get('storage_id', ''),
+                'remote_path': item.get('remote_path') or item['remote_id'],
+                'local_path': item.get('local_path', '') if complete else '',
+                'size_bytes': item.get('size_bytes'),
+                'captured_at': item.get('captured_at', ''),
+                'kind': item.get('kind', 'FILE'),
+                'status': status,
+                'completed_at': now if complete else '',
+                'created_at': now,
+                'updated_at': now,
+            })
+        if not rows:
+            return 0
+        with self._connection() as conn:
+            conn.executemany(
+                '''
+                INSERT INTO media (
+                    device_id, remote_id, storage_id, remote_path, local_path, size_bytes,
+                    captured_at, kind, status, completed_at, created_at, updated_at
+                ) VALUES (
+                    :device_id, :remote_id, :storage_id, :remote_path, :local_path, :size_bytes,
+                    :captured_at, :kind, :status, :completed_at, :created_at, :updated_at
+                )
+                ON CONFLICT(device_id, remote_id) DO UPDATE SET
+                    storage_id = excluded.storage_id,
+                    remote_path = excluded.remote_path,
+                    local_path = excluded.local_path,
+                    size_bytes = COALESCE(excluded.size_bytes, media.size_bytes),
+                    captured_at = excluded.captured_at,
+                    kind = excluded.kind,
+                    status = excluded.status,
+                    completed_at = CASE
+                        WHEN excluded.status = 'complete' AND media.completed_at <> ''
+                            THEN media.completed_at
+                        ELSE excluded.completed_at
+                    END,
+                    updated_at = excluded.updated_at
+                ''',
+                rows,
+            )
+        return len(rows)
+
+    def mark_media_complete(self, device_id, remote_id, local_path, size_bytes=None,
+                            storage_id='', remote_path='', kind='FILE', captured_at=''):
+        """Record a finished download once the file is fully written and renamed."""
+        return self.record_media({
+            'device_id': device_id,
+            'remote_id': remote_id,
+            'storage_id': storage_id,
+            'remote_path': remote_path or remote_id,
+            'local_path': local_path,
+            'size_bytes': size_bytes,
+            'captured_at': captured_at,
+            'kind': kind,
+            'status': 'complete',
+            'completed_at': utc_now(),
+        })
+
+    def list_media(self, device_id, status=None, limit=None):
+        self.initialize()
+        query = 'SELECT * FROM media WHERE device_id = ?'
+        params = [device_id]
+        if status:
+            query += ' AND status = ?'
+            params.append(status)
+        query += ' ORDER BY captured_at DESC, remote_id'
+        if limit:
+            query += ' LIMIT ?'
+            params.append(int(limit))
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_media(self, device_id, status=None):
+        self.initialize()
+        query = 'SELECT COUNT(*) AS total FROM media WHERE device_id = ?'
+        params = [device_id]
+        if status:
+            query += ' AND status = ?'
+            params.append(status)
+        with self._connection() as conn:
+            return conn.execute(query, params).fetchone()['total']
+
     def start_sync_run(self, device_id):
         self.initialize()
         with self._connection() as conn:
@@ -283,18 +393,33 @@ class SyncStore:
         return self.get_sync_run(run_id)
 
     def finish_sync_run(self, run_id, status, scanned_count=0, added_count=0, skipped_count=0,
-                        downloaded_bytes=0, error_summary=''):
+                        downloaded_bytes=None, error_summary=''):
+        """Close a run; ``downloaded_bytes`` stays untouched unless given, because
+        downloads reported by workers may already have been credited to it."""
         self.initialize()
         with self._connection() as conn:
             conn.execute(
                 '''
                 UPDATE sync_runs
                 SET status = ?, finished_at = ?, scanned_count = ?, added_count = ?,
-                    skipped_count = ?, downloaded_bytes = ?, error_summary = ?
+                    skipped_count = ?, downloaded_bytes = COALESCE(?, downloaded_bytes),
+                    error_summary = ?
                 WHERE id = ?
                 ''',
                 (status, utc_now(), scanned_count, added_count, skipped_count, downloaded_bytes,
                  error_summary, run_id),
+            )
+        return self.get_sync_run(run_id)
+
+    def add_downloaded_bytes(self, run_id, size_bytes):
+        """Attribute a completed file to the run that scheduled it."""
+        if not run_id or not size_bytes:
+            return None
+        self.initialize()
+        with self._connection() as conn:
+            conn.execute(
+                'UPDATE sync_runs SET downloaded_bytes = downloaded_bytes + ? WHERE id = ?',
+                (int(size_bytes), run_id),
             )
         return self.get_sync_run(run_id)
 
@@ -303,6 +428,32 @@ class SyncStore:
         with self._connection() as conn:
             row = conn.execute('SELECT * FROM sync_runs WHERE id = ?', (run_id,)).fetchone()
         return dict(row) if row else None
+
+    def list_sync_runs(self, device_id=None, limit=20):
+        self.initialize()
+        query = 'SELECT * FROM sync_runs'
+        params = []
+        if device_id:
+            query += ' WHERE device_id = ?'
+            params.append(device_id)
+        query += ' ORDER BY started_at DESC, id DESC LIMIT ?'
+        params.append(int(limit))
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_sync_errors(self, device_id=None, limit=20):
+        self.initialize()
+        query = 'SELECT * FROM sync_errors'
+        params = []
+        if device_id:
+            query += ' WHERE device_id = ?'
+            params.append(device_id)
+        query += ' ORDER BY created_at DESC, id DESC LIMIT ?'
+        params.append(int(limit))
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     def record_error(self, device_id, message, sync_run_id=None, remote_id='', error_code='', retryable=True):
         self.initialize()
@@ -318,6 +469,46 @@ class SyncStore:
             error_id = cursor.lastrowid
             row = conn.execute('SELECT * FROM sync_errors WHERE id = ?', (error_id,)).fetchone()
         return dict(row)
+
+    def device_summary(self, device_id):
+        """Counters the device overview needs, in one round trip."""
+        self.initialize()
+        with self._connection() as conn:
+            totals = conn.execute(
+                '''
+                SELECT
+                    COUNT(*) AS total_count,
+                    COALESCE(SUM(status = 'complete'), 0) AS completed_count,
+                    COALESCE(SUM(CASE WHEN status = 'complete' THEN size_bytes ELSE 0 END), 0)
+                        AS completed_bytes
+                FROM media WHERE device_id = ?
+                ''',
+                (device_id,),
+            ).fetchone()
+            last_success = conn.execute(
+                '''
+                SELECT finished_at FROM sync_runs
+                WHERE device_id = ? AND status = 'success' AND finished_at <> ''
+                ORDER BY started_at DESC, id DESC LIMIT 1
+                ''',
+                (device_id,),
+            ).fetchone()
+            last_error = conn.execute(
+                '''
+                SELECT message, error_code, created_at FROM sync_errors
+                WHERE device_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+                ''',
+                (device_id,),
+            ).fetchone()
+        completed = totals['completed_count']
+        return {
+            'media_count': totals['total_count'],
+            'completed_count': completed,
+            'pending_count': totals['total_count'] - completed,
+            'completed_bytes': totals['completed_bytes'],
+            'last_success_at': last_success['finished_at'] if last_success else '',
+            'last_error': dict(last_error) if last_error else None,
+        }
 
 
 MIGRATIONS[1] = SyncStore._create_schema

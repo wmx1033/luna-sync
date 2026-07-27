@@ -21,8 +21,11 @@ jobs:
           python-version: "3.12"
       - name: Check Python syntax
         run: python -m compileall -q app tests
+      - name: Install web runtime dependencies
+        run: python -m pip install --upgrade flask
       - name: Run unit tests
         run: |
           python -m unittest discover -s tests -p 'test_core.py' -v
           python -m unittest discover -s tests -p 'test_sync_store.py' -v
           python -m unittest discover -s tests -p 'test_drivers.py' -v
+          python -m unittest discover -s tests -p 'test_web_app.py' -v

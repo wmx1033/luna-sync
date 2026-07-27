@@ -2,9 +2,9 @@ import os, sys, json, time, threading, socket, subprocess, logging, io, mimetype
 import urllib.request, urllib.error
 from flask import Flask, jsonify, request, render_template, send_file, Response, abort
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from camera_driver import file_kind
+from camera_driver import DriverError, file_kind
 from downloader import download_file
-from driver_registry import create_driver_for_device
+from driver_registry import create_driver_for_device, device_endpoint, driver_catalog
 from sync_store import LEGACY_LUNA_DEVICE_ID, SyncStore
 import wifi
 try:
@@ -12,7 +12,8 @@ try:
 except Exception:
     Image = None
 
-CFG = json.load(open(os.environ.get('LUNA_CONFIG', '/app/config.json')))
+with open(os.environ.get('LUNA_CONFIG', '/app/config.json')) as _cfg_file:
+    CFG = json.load(_cfg_file)
 logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(message)s', stream=sys.stdout)
 log = logging.getLogger('luna')
 app = Flask(__name__)
@@ -26,11 +27,22 @@ def disable_home_cache(response):
 HOST = CFG['camera_host']
 DLDIR = os.environ.get('DOWNLOAD_DIR') or CFG['download_dir']
 
+def active_device():
+    device = SYNC_STORE.get_device(DEVICE_ID)
+    if not device:
+        raise RuntimeError('default camera device is unavailable')
+    return device
+
 def active_camera_driver():
-    device = SYNC_STORE.get_device(LEGACY_LUNA_DEVICE_ID)
-    if device:
-        return create_driver_for_device(device)
-    raise RuntimeError('default camera device is unavailable')
+    return create_driver_for_device(active_device())
+
+def camera_endpoint():
+    """Where the network layer must reach the camera, as declared by its driver."""
+    try:
+        return device_endpoint(active_device())
+    except Exception as e:
+        log.warning('camera_endpoint:' + str(e)[:60])
+        return HOST, 80
 
 def configured_wifi_backend():
     return os.environ.get('LUNA_WIFI_BACKEND') or CFG.get('wifi_backend', 'auto')
@@ -55,10 +67,11 @@ SETTINGS_FILE = os.path.join(STATE_DIR, 'settings.json')
 for d in (DLDIR, THUMB_DIR, ENC_DIR, PREVIEW_SRC_DIR):
     os.makedirs(d, exist_ok=True)
 
-# M1 keeps the existing single-camera runtime intact while persisting its
-# equivalent default device for the upcoming multi-device sync engine.
+# The runtime still drives a single camera, but every device, media record and
+# sync run now lives in the store that the multi-device engine will inherit.
 SYNC_STORE = SyncStore(os.path.join(STATE_DIR, 'sync.db'))
-SYNC_STORE.migrate_legacy_config(CFG)
+DEVICE = SYNC_STORE.migrate_legacy_config(CFG)
+DEVICE_ID = (DEVICE or {}).get('id', LEGACY_LUNA_DEVICE_ID)
 
 lk = threading.Lock()
 scan_lk = threading.Lock()
@@ -118,7 +131,8 @@ def _triggered_scan():
         return r.stdout, False
 
 ST = {'connected': False, 'wifi_conn': False, 'files': [], 'queue': [], 'current': None,
-      'completed': 0, 'log': [], 'wifi_current': '', 'wifi_target': CAM_SSID, 'wifi_password': None,
+      'completed': SYNC_STORE.count_media(DEVICE_ID, 'complete'), 'sync_run_id': None,
+      'log': [], 'wifi_current': '', 'wifi_target': CAM_SSID, 'wifi_password': None,
       'wifi_saved': False, 'transcodes': {}, 'auto_sync': bool_value(SETTINGS.get('auto_sync'), bool_value(CFG.get('auto_sync'), True)),
       'auto_sync_lrv': bool_value(SETTINGS.get('auto_sync_lrv'), bool_value(CFG.get('auto_sync_lrv'), True)),
       'last_auto_sync': ''}
@@ -200,7 +214,7 @@ def wifi_on_target():
 
 def cam_on():
     try:
-        socket.create_connection((HOST, 80), 2).close(); return True
+        socket.create_connection(camera_endpoint(), 2).close(); return True
     except OSError:
         return False
 
@@ -375,7 +389,80 @@ def file_key(item):
 def local_dest_for(item):
     return safe_path(DLDIR, file_key(item))
 
-def refresh():
+def captured_at(item):
+    return ((item.get('date') or '') + ' ' + (item.get('time') or '')).strip()
+
+def start_sync_run():
+    try:
+        run = SYNC_STORE.start_sync_run(DEVICE_ID)
+    except Exception as e:
+        log.warning('start_sync_run:' + str(e)[:60])
+        return None
+    with lk:
+        ST['sync_run_id'] = run['id']
+    return run
+
+def finish_sync_run(run, status, scanned=0, added=0, skipped=0, error_summary=''):
+    if not run:
+        return
+    try:
+        SYNC_STORE.finish_sync_run(run['id'], status, scanned_count=scanned, added_count=added,
+                                   skipped_count=skipped, error_summary=error_summary[:200])
+    except Exception as e:
+        log.warning('finish_sync_run:' + str(e)[:60])
+
+def record_sync_error(exc, fallback='同步失败', remote_id='', code=''):
+    """Keep driver and download failures in the device history instead of only in logs."""
+    retryable = True
+    if isinstance(exc, DriverError):
+        code = code or exc.code
+        retryable = exc.retryable
+    code = code or 'internal_error'
+    message = (str(exc) or fallback)[:200]
+    with lk:
+        run_id = ST['sync_run_id']
+    try:
+        SYNC_STORE.record_error(DEVICE_ID, message, sync_run_id=run_id, remote_id=remote_id,
+                                error_code=code, retryable=retryable)
+    except Exception as e:
+        log.warning('record_error:' + str(e)[:60])
+    return message
+
+def scanned_media_records(files, loc):
+    records = []
+    for f in files:
+        key = file_key(f)
+        local = loc.get(key)
+        if local is None and f.get('storage') == 'internal':
+            local = loc.get(f['name'])
+        records.append({
+            'remote_id': key,
+            'storage_id': f.get('storage') or 'internal',
+            'remote_path': f.get('path') or f['name'],
+            'local_path': local['path'] if local else '',
+            'size_bytes': local['size'] if local else f.get('bytes'),
+            'captured_at': captured_at(f),
+            'kind': f.get('kind') or file_kind(f['name']),
+            'status': 'complete' if local else 'pending',
+        })
+    return records
+
+def record_completed_media(item, dest, size_bytes):
+    key = file_key(item)
+    try:
+        SYNC_STORE.mark_media_complete(
+            DEVICE_ID, key, dest, size_bytes=size_bytes,
+            storage_id=item.get('storage') or 'internal',
+            remote_path=item.get('path') or item['name'],
+            kind=item.get('kind') or file_kind(item['name']),
+            captured_at=captured_at(item))
+        with lk:
+            run_id = ST['sync_run_id']
+        SYNC_STORE.add_downloaded_bytes(run_id, size_bytes)
+    except Exception as e:
+        log.warning('record_media:' + str(e)[:60])
+
+def refresh(persist=False):
     with refresh_lk:
         if not (wifi_on_target() and cam_on()):
             with lk:
@@ -395,9 +482,18 @@ def refresh():
                 f['status'] = '完成' if key in loc or legacy_done else '就绪'
             with lk:
                 ST['files'] = files; ST['connected'] = True
+            if persist:
+                try:
+                    SYNC_STORE.record_scanned_media(DEVICE_ID, scanned_media_records(files, loc))
+                    with lk:
+                        ST['completed'] = SYNC_STORE.count_media(DEVICE_ID, 'complete')
+                except Exception as e:
+                    log.warning('record_scanned_media:' + str(e)[:60])
             return True
         except Exception as e:
             addlog('列文件失败:' + str(e)[:60])
+            if persist:
+                record_sync_error(e, '扫描相机文件失败')
             with lk:
                 ST['connected'] = False
             return False
@@ -433,29 +529,39 @@ def auto_sync_once(manual=False):
             addlog('自动同步已在运行')
         return 0
     try:
+        # A run is only opened once the camera actually answers, so an absent
+        # camera stays "waiting" instead of filling the history with errors.
         if not prepare_auto_sync_connection():
             if manual:
                 addlog('自动同步未开始: 相机未就绪')
             return 0
-        if not refresh():
-            if manual:
-                addlog('自动同步未开始: 扫描相机文件失败')
-            return 0
-        with lk:
-            include_lrv = ST['auto_sync_lrv']
-            files = list(ST['files'])
-            names = [file_key(f) for f in files if include_lrv or f.get('kind') != 'LRV']
-            skipped_lrv = len(files) - len(names)
-        if skipped_lrv and manual:
-            addlog('自动同步跳过 ' + str(skipped_lrv) + ' 个 LRV 文件')
-        added, _ = enqueue(names)
-        with lk:
-            ST['last_auto_sync'] = time.strftime('%H:%M:%S')
-        if added:
-            addlog('自动同步加入 ' + str(added) + ' 个新文件')
-        elif manual:
-            addlog('自动同步检查完成，没有新文件')
-        return added
+        run = start_sync_run()
+        try:
+            if not refresh(persist=True):
+                if manual:
+                    addlog('自动同步未开始: 扫描相机文件失败')
+                finish_sync_run(run, 'error', error_summary='扫描相机文件失败')
+                return 0
+            with lk:
+                include_lrv = ST['auto_sync_lrv']
+                files = list(ST['files'])
+                names = [file_key(f) for f in files if include_lrv or f.get('kind') != 'LRV']
+                skipped_lrv = len(files) - len(names)
+            if skipped_lrv and manual:
+                addlog('自动同步跳过 ' + str(skipped_lrv) + ' 个 LRV 文件')
+            added, _ = enqueue(names)
+            with lk:
+                ST['last_auto_sync'] = time.strftime('%H:%M:%S')
+            finish_sync_run(run, 'success', scanned=len(files), added=added,
+                            skipped=len(files) - added)
+            if added:
+                addlog('自动同步加入 ' + str(added) + ' 个新文件')
+            elif manual:
+                addlog('自动同步检查完成，没有新文件')
+            return added
+        except Exception as e:
+            finish_sync_run(run, 'error', error_summary=record_sync_error(e, '自动同步失败'))
+            raise
     finally:
         auto_sync_lk.release()
 
@@ -524,10 +630,14 @@ def dl_worker():
                 with lk:
                     ST['current'] = {'id': key, 'name': n, 'downloaded': d, 'total': t, 'speed': s}
             download_file(cli.open_download(f), dest, on_progress=prog, cancel=cancel)
+            size = os.path.getsize(dest) if os.path.exists(dest) else f.get('bytes')
+            record_completed_media(f, dest, size)
             with lk:
                 ST['completed'] += 1; ST['current'] = None
             addlog('完成 ' + name)
         except Exception as e:
+            record_sync_error(e, '下载失败', remote_id=key,
+                              code='cancelled' if str(e) == 'cancelled' else '')
             addlog('失败 ' + name + ':' + str(e)[:60])
             with lk:
                 ST['current'] = None
@@ -622,6 +732,34 @@ def api_state():
             'auto_sync': ST['auto_sync'], 'auto_interval': AUTO_INTERVAL,
             'auto_sync_lrv': ST['auto_sync_lrv'],
             'last_auto_sync': ST['last_auto_sync']})
+
+def device_public(device):
+    """Device view for the UI; connection secrets never leave the store."""
+    view = {
+        'id': device['id'],
+        'display_name': device['display_name'],
+        'driver': device['driver'],
+        'camera_host': device['camera_host'],
+        'ssid': device['ssid'],
+        'priority': device['priority'],
+        'enabled': bool(device['enabled']),
+        'archive_root': device['archive_root'],
+        'has_credential': bool(device['credential_ref']),
+    }
+    view.update(SYNC_STORE.device_summary(device['id']))
+    return view
+
+@app.route('/api/devices')
+def api_devices():
+    return jsonify({'items': [device_public(d) for d in SYNC_STORE.list_devices()],
+                    'active': DEVICE_ID, 'drivers': driver_catalog()})
+
+@app.route('/api/devices/<device_id>/runs')
+def api_device_runs(device_id):
+    if not SYNC_STORE.get_device(device_id):
+        abort(404)
+    return jsonify({'runs': SYNC_STORE.list_sync_runs(device_id, limit=20),
+                    'errors': SYNC_STORE.list_sync_errors(device_id, limit=20)})
 
 @app.route('/api/auto-sync', methods=['POST'])
 def api_auto_sync():
