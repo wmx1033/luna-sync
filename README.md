@@ -1,14 +1,14 @@
 # Insta360 Sync
 
-Insta360 Sync 是面向 NAS 的本地相机媒体同步工具。它可以连接相机 Wi-Fi，浏览、下载和转码相机中的
-照片与视频，并提供网页管理界面；支持 Linux Docker/NAS 与 Windows 独立程序。
+Insta360 Sync 是面向 Linux / NAS 的本地相机媒体同步工具。它可以连接相机 Wi-Fi，浏览、下载和转码相机中的
+照片与视频，并提供网页管理界面。
 
 本仓库由 [Luna Sync](https://github.com/hongjiahao371-pixel/luna-sync) fork 而来，遵循原项目的 MIT 许可证。
 当前可用驱动为 Luna Ultra；v2.0 正在扩展为多设备同步服务，目标支持 Luna Ultra、Ace Pro 2 和 GO Ultra。
 
 ## 功能
 
-- 支持 Windows Native Wi-Fi、NetworkManager、wpa_supplicant 和手动连接模式
+- 支持 NetworkManager、wpa_supplicant 和手动连接模式
 - 自动识别宿主机无线网卡，也可手动指定
 - 扫描并连接相机 Wi-Fi，或只使用用户已手动连接好的网络
 - 连上相机 Wi-Fi 后自动增量同步新文件
@@ -29,26 +29,6 @@ Insta360 Sync 是面向 NAS 的本地相机媒体同步工具。它可以连接�
 自动管理无线网络时需要 `network_mode: host` 和 `privileged: true`。macOS/Windows
 Docker Desktop 不能直接管理宿主机无线网卡，但可以使用手动连接模式。
 
-## Windows EXE
-
-Windows x64 版会直接使用系统无线网络接口，不依赖 Docker、NetworkManager 或
-wpa_supplicant。首次启动会自动打开 `http://127.0.0.1:8765`，默认目录为：
-
-- 素材：`%USERPROFILE%\Videos\Insta360 Sync`
-- 配置和缓存：`%LOCALAPPDATA%\Insta360Sync`
-
-关闭 Insta360 Sync 的控制台窗口即可退出程序。Windows 可执行文件必须在 Windows 上构建；
-仓库的 `Build Windows EXE` GitHub Actions 会生成 `Insta360Sync-Windows-x64` 构建产物。
-也可以在 Windows PowerShell 中本地构建：
-
-```powershell
-python -m pip install -r windows/requirements.txt
-python windows/prepare_assets.py
-python -m PyInstaller --clean --noconfirm windows/luna_sync.spec
-```
-
-生成文件位于 `dist\Insta360Sync.exe`。
-
 ## Wi-Fi 后端
 
 `wifi_backend` 支持以下值：
@@ -56,7 +36,6 @@ python -m PyInstaller --clean --noconfirm windows/luna_sync.spec
 | 值 | 适用场景 |
 |---|---|
 | `auto` | 默认值；优先使用 NetworkManager，其次使用 wpa_supplicant，最后退到手动模式 |
-| `windows` | Windows 独立程序，使用系统 Native Wi-Fi 接口 |
 | `networkmanager` | Ubuntu、Debian、树莓派等宿主机已运行 NetworkManager 的环境 |
 | `wpa_supplicant` | NAS/精简 Linux，有无线网卡驱动但没有 NetworkManager 的环境 |
 | `none` | 程序不管理 Wi-Fi；用户自己让部署设备能访问 `camera_host` |
@@ -120,9 +99,6 @@ docker-compose.networkmanager.yml
 Dockerfile
 entrypoint.sh
 config.example.json
-windows/
-  launcher.py      Windows 启动入口
-  luna_sync.spec   PyInstaller 打包配置
 ```
 
 ## 配置
@@ -133,7 +109,7 @@ windows/
 | `camera_ssid` | 相机 Wi-Fi 名称 |
 | `camera_password` | 相机 Wi-Fi 密码 |
 | `camera_client_cidr` | wpa_supplicant 模式下为无线网卡配置的相机网段地址 |
-| `wifi_backend` | `auto`、`windows`、`networkmanager`、`wpa_supplicant` 或 `none` |
+| `wifi_backend` | `auto`、`networkmanager`、`wpa_supplicant` 或 `none` |
 | `wifi_iface` | 无线网卡名；`null` 时自动识别 |
 | `wpa_ctrl` | wpa_supplicant 控制 socket 目录 |
 | `auto_sync` | 是否自动增量同步 |
@@ -150,6 +126,7 @@ windows/
 
 v2.0 的实施任务与验收标准见 [多设备 NAS 自动备份 PRD](docs/PRD-multi-insta360-nas-sync.md)。
 本地验证、NAS 部署检查与配置迁移原则见[开发说明](docs/DEVELOPMENT.md)。
+Windows 版本不属于 v2.0 范围，相关遗留代码仅为未来规划保留，当前不构建或发布。
 
 ## 更新日志
 

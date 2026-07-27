@@ -106,7 +106,7 @@ class WindowsLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / 'data' / 'config.json'
-            downloads = root / 'Videos' / 'Insta360 Sync'
+            downloads = root / 'Videos' / 'Luna Sync'
             state = root / 'data' / 'state'
             config = launcher.ensure_config(config_path, downloads, state)
             saved = json.loads(config_path.read_text(encoding='utf-8'))
@@ -115,19 +115,6 @@ class WindowsLauncherTests(unittest.TestCase):
             self.assertEqual(Path(saved['download_dir']), downloads)
             self.assertTrue(downloads.is_dir())
             self.assertTrue(state.is_dir())
-
-    def test_legacy_config_directory_is_reused_when_new_directory_is_empty(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            local_app_data = Path(tmp) / 'AppData' / 'Local'
-            legacy_config = local_app_data / 'LunaSync' / 'config.json'
-            legacy_config.parent.mkdir(parents=True)
-            legacy_config.write_text('{}', encoding='utf-8')
-            with patch.dict(os.environ, {'LOCALAPPDATA': str(local_app_data)}):
-                with patch.object(launcher, 'videos_dir', return_value=Path(tmp) / 'Videos'):
-                    data_dir, downloads = launcher.resolve_paths()
-            self.assertEqual(data_dir, legacy_config.parent)
-            self.assertEqual(downloads, Path(tmp) / 'Videos' / 'Insta360 Sync')
-
 
 if __name__ == '__main__':
     unittest.main()

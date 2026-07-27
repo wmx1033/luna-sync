@@ -5,8 +5,8 @@
 本项目目前使用 Python 标准库的 `unittest` 测试集：
 
 ```bash
-python3 -m compileall -q app windows tests
-python3 -m unittest discover -s tests -v
+python3 -m compileall -q app tests
+python3 -m unittest discover -s tests -p 'test_core.py' -v
 ```
 
 持续集成会在推送到 `main`、`codex/**` 分支以及所有拉取请求中运行相同的测试。
@@ -34,9 +34,6 @@ docker compose -f docker-compose.yml -f docker-compose.networkmanager.yml up -d 
 
 M1 引入多设备 SQLite 数据库前，继续兼容现有单设备 `config.json`。首次迁移会将其创建为一个
 `luna_ultra` 默认设备，并保留下载目录、状态目录及 Wi-Fi 设置；不会移动或重命名已有媒体文件。
-
-Windows 版首次运行使用 `%LOCALAPPDATA%\Insta360Sync`。若该位置尚无配置，而旧
-`%LOCALAPPDATA%\LunaSync\config.json` 存在，则自动继续使用旧配置目录，以避免现有用户丢失设置。
 
 ## 协议调试约束
 

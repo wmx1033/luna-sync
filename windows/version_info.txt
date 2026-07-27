@@ -14,13 +14,13 @@ VSVersionInfo(
       StringTable(
         '040904B0',
         [
-          StringStruct('CompanyName', 'Insta360 Sync'),
-          StringStruct('FileDescription', 'Insta360 camera media sync tool'),
+          StringStruct('CompanyName', 'Luna Sync'),
+          StringStruct('FileDescription', 'Luna Ultra media sync tool'),
           StringStruct('FileVersion', '1.2.1.0'),
-          StringStruct('InternalName', 'Insta360Sync'),
-          StringStruct('LegalCopyright', 'Insta360 Sync contributors'),
-          StringStruct('OriginalFilename', 'Insta360Sync.exe'),
-          StringStruct('ProductName', 'Insta360 Sync'),
+          StringStruct('InternalName', 'LunaSync'),
+          StringStruct('LegalCopyright', 'Luna Sync contributors'),
+          StringStruct('OriginalFilename', 'LunaSync.exe'),
+          StringStruct('ProductName', 'Luna Sync'),
           StringStruct('ProductVersion', '1.2.1.0')
         ]
       )
